@@ -1,0 +1,1037 @@
+---
+title: "Model Selection dengan AIC/CV untuk Prediksi Output Listrik CCPP"
+subtitle: "Pemilihan model, validasi silang, dan stabilitas hasil pada lima pengacakan"
+author: "Adit (140720260011) · Sopo (140720260017)"
+date: "Tahun Ajaran 2026/2027"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    df_print: kable
+header-includes:
+  - |
+    <style>
+      body { font-family: "Segoe UI", Arial, sans-serif; color: #243041; line-height: 1.6; }
+      .main-container { max-width: 1200px; width: 96%; }
+      /* Judul otomatis disembunyikan karena sudah ada di halaman sampul */
+      h1.title, h4.author, h4.date { display: none; }
+      h1 { border-bottom: 2px solid #e5edf6; padding-bottom: 6px; margin-top: 36px; }
+      .cover { text-align: center; padding: 40px 20px 30px; border: 1px solid #c3ccd6;
+               border-radius: 6px; margin-bottom: 30px; background: #fbfcfe; }
+      @media (max-width: 768px) { .main-container { width: 98%; } }
+    </style>
+---
+
+<div class="cover">
+<p style="font-size:20px; font-weight:bold; margin-bottom:6px;">ANALISIS PEMILIHAN MODEL DENGAN AIC DAN CROSS-VALIDATION<br>UNTUK PREDIKSI OUTPUT LISTRIK CCPP</p>
+<p style="font-size:14px; color:#4b5563;">Pemilihan model, validasi silang, dan stabilitas hasil pada lima pengacakan</p>
+<p style="font-size:14px; font-weight:bold; margin-top:30px;">Dosen Pembimbing:</p>
+<p style="font-size:14px;">Prof. Dr. I Gede Nyoman Mindra Jaya, M.Si.</p>
+<p style="font-size:14px; font-weight:bold; margin-top:30px;">Disusun Oleh:</p>
+<p style="font-size:14px;">Adit (140720260011)<br>Sopo (140720260017)</p>
+<p style="font-size:16px; font-weight:bold; margin-top:30px; line-height:1.8;">PROGRAM STUDI ...<br>DEPARTEMEN ...<br>FAKULTAS ...<br>UNIVERSITAS ...<br>TAHUN AJARAN 2026/2027</p>
+</div>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 9, fig.height = 4.5)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mgcv)      # GAM
+library(ranger)    # Random Forest (benchmark)
+library(car)       # VIF
+library(lmtest)    # Breusch-Pagan, coeftest
+library(sandwich)  # SE robust (HC3)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 11))
+
+# Tabel HTML: gaya ditulis inline di tiap elemen supaya tabel tetap tampil rapi
+# (border, padding, header berwarna) walaupun CSS dari header tidak terbawa saat knit.
+# Dibungkus <div> agar tabel yang lebar bisa digeser ke samping di layar kecil.
+tabel <- function(x, caption = NULL, format = "html",
+                  table.attr = 'class="report-table"', ...) {
+  out <- as.character(knitr::kable(x, format = "html", caption = caption,
+                                   table.attr = table.attr, ...))
+  out <- sub("<table",
+             '<table style="border-collapse:collapse;font-size:13px;line-height:1.45;margin:0;"',
+             out, fixed = TRUE)
+  out <- sub("<caption>",
+             '<caption style="caption-side:top;text-align:left;font-weight:700;color:#1f2937;padding:0 0 8px;">',
+             out, fixed = TRUE)
+  out <- gsub("<th>", '<th style=""', out, fixed = TRUE)
+  out <- gsub("<td>", '<td style=""', out, fixed = TRUE)
+  out <- gsub('<th style="',
+              '<th style="background:#e5edf6;color:#1f2937;border:1px solid #9eacbb;padding:7px 10px;font-weight:700;vertical-align:middle;white-space:nowrap;',
+              out, fixed = TRUE)
+  out <- gsub('<td style="',
+              '<td style="border:1px solid #c3ccd6;padding:7px 10px;vertical-align:middle;',
+              out, fixed = TRUE)
+  knitr::asis_output(paste0('<div style="overflow-x:auto;margin:12px 0 22px;">', out, '</div>'))
+}
+
+RANDOM_STATE <- 42
+K_FOLDS      <- 10
+TEST_SIZE    <- 0.20
+B_BOOT       <- 1000
+RF_TREES_CV  <- 200
+RF_TREES_FINAL <- 500
+DATA_FILE    <- "Folds5x2_pp.xlsx"
+target       <- "PE"
+features     <- c("AT", "V", "AP", "RH")
+set.seed(RANDOM_STATE)
+```
+
+# Pertanyaan penelitian
+
+**Pertanyaan utama:** seberapa kompleks bentuk hubungan antara kondisi lingkungan (AT, V, AP, RH) dan output listrik (PE) yang didukung oleh data, dan apakah AIC dan 10-fold cross-validation (CV) memilih model yang sama?
+
+Untuk menjawabnya, disusun satu himpunan kandidat model dengan kompleksitas yang meningkat secara bertahap. Setiap model punya peran yang jelas:
+
+| Peran | Model | Dinilai dengan |
+|---|---|---|
+| Baseline | M0: regresi linear (OLS) | AICc + CV + data uji |
+| Kandidat | M1: polinomial aditif derajat 2 | AICc + CV + data uji |
+| Kandidat | M2: polinomial aditif derajat 3 | AICc + CV + data uji |
+| Kandidat | M3: polinomial derajat 2 + interaksi | AICc + CV + data uji |
+| Kandidat | M4: GAM (spline berpenalti, REML) | AICc (edf) + CV + data uji |
+| Benchmark | Random Forest | CV + data uji saja (tanpa likelihood → tanpa AIC) |
+
+Semua model statistik (M0–M4) diestimasi dengan likelihood Gaussian pada respons dan data latih yang sama, sehingga AICc-nya dapat dibandingkan. Random Forest tidak memiliki likelihood, sehingga hanya dibandingkan dari sisi akurasi prediksi.
+
+# Data
+
+```{r read-data}
+sheets <- excel_sheets(DATA_FILE)
+data_sheets <- lapply(sheets, function(sh) {
+  d <- as.data.frame(read_excel(DATA_FILE, sheet = sh))
+  names(d) <- trimws(names(d))
+  miss <- setdiff(c(features, target), names(d))
+  if (length(miss) > 0) stop(sh, ": kolom tidak ditemukan -> ", paste(miss, collapse = ", "))
+  d[, c(features, target)]
+})
+names(data_sheets) <- sheets
+
+# Apakah setiap sheet berisi data yang sama (hanya urutannya diacak)?
+sort_df <- function(d) { d <- d[do.call(order, d), ]; rownames(d) <- NULL; d }
+ref <- sort_df(data_sheets[[1]])
+verify_df <- data.frame(
+  Sheet = sheets,
+  n = sapply(data_sheets, nrow),
+  Identik_dgn_Sheet1_setelah_sort = sapply(data_sheets, function(d) identical(sort_df(d), ref))
+)
+tabel(verify_df, caption = "Verifikasi isi tiap sheet dibanding Sheet1 (setelah diurutkan)")
+
+df <- data_sheets[[1]]
+n_total <- nrow(df)
+```
+
+**Unit observasi:** satu baris adalah rata-rata per jam kondisi lingkungan dan output listrik bersih CCPP saat beroperasi pada beban penuh (2006–2011; Tüfekci, 2014). Kelima sheet berisi `r n_total` observasi yang sama, dengan urutan baris berbeda. Karena itu, kelima sheet **bukan lima sampel independen**. Di analisis ini, setiap sheet digunakan untuk satu pengacakan pembagian latih/uji dan fold CV yang berbeda, sehingga kami bisa mengukur **sensitivitas hasil terhadap pembagian data**. Ini bisa menunjukkan bias prediksi sistematis pada data uji masing-masing pengacakan, tetapi tidak membuktikan ada atau tidaknya bias pada populasi pembangkit secara umum.
+
+```{r data-dictionary}
+data_dict <- data.frame(
+  Variabel = c("AT", "V", "AP", "RH", "PE"),
+  Nama     = c("Ambient Temperature", "Exhaust Vacuum", "Ambient Pressure",
+               "Relative Humidity", "Net hourly electrical energy output"),
+  Satuan   = c("°C", "cm Hg", "mbar", "%", "MW"),
+  Peran    = c("Prediktor", "Prediktor", "Prediktor", "Prediktor", "Respons"),
+  Rentang  = sapply(df[, c(features, target)], function(x) sprintf("%.2f – %.2f", min(x), max(x)))
+)
+tabel(data_dict, caption = "Kamus data")
+```
+
+**Alasan pemilihan prediktor dan pencegahan leakage:** keempat prediktor adalah kondisi lingkungan yang relevan untuk menjelaskan output. Tidak ada variabel turunan dari PE yang dimasukkan sebagai prediktor. Analisis ini mengestimasi PE ketika AT, V, AP, dan RH tersedia; untuk klaim peramalan operasional ke depan, ketersediaan nilai prediktor pada saat prediksi tetap harus dipastikan.
+
+# Eksplorasi data terarah
+
+```{r eda-quality}
+desc_stats <- data.frame(
+  Mean = sapply(df, mean), SD = sapply(df, sd), Min = sapply(df, min),
+  Q1 = sapply(df, quantile, 0.25), Median = sapply(df, median),
+  Q3 = sapply(df, quantile, 0.75), Max = sapply(df, max)
+)
+desc_stats_table <- tibble::rownames_to_column(round(desc_stats, 3), var = "Variabel")
+tabel(desc_stats_table, format = "html", caption = "Statistik deskriptif setiap variabel",
+             table.attr = 'class="report-table"')
+
+n_missing <- sum(is.na(df))
+n_dup     <- sum(duplicated(df))
+iqr_out   <- sapply(df, function(s) {
+  q <- quantile(s, c(.25, .75)); i <- diff(q)
+  sum(s < q[1] - 1.5 * i | s > q[2] + 1.5 * i)
+})
+iqr_table <- data.frame(
+  Variabel = names(iqr_out),
+  Jumlah_outlier_IQR = as.integer(iqr_out),
+  row.names = NULL
+)
+tabel(iqr_table, format = "html", caption = "Jumlah observasi di luar batas IQR",
+             table.attr = 'class="report-table"')
+```
+
+Tidak ada nilai hilang (`r n_missing`). Ditemukan `r n_dup` baris duplikat. Duplikat **dipertahankan** karena data berupa rata-rata per jam dengan presisi terbatas, sehingga kombinasi nilai yang sama dapat terjadi secara wajar pada jam berbeda. Jumlahnya juga sangat kecil (`r round(100 * n_dup / n_total, 2)`% dari data). Outlier IQR pada AP dan RH tetap dipertahankan karena nilainya masih dalam rentang fisik yang wajar. Pengaruhnya diperiksa lewat Cook's distance (bagian Diagnostik model terpilih).
+
+```{r eda-scatter, fig.height=5}
+df_long <- df %>% pivot_longer(all_of(features), names_to = "Prediktor", values_to = "Nilai")
+ggplot(df_long, aes(Nilai, PE)) +
+  geom_point(alpha = 0.08, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, colour = "grey40", linetype = 2, linewidth = 0.7) +
+  geom_smooth(method = "gam", formula = y ~ s(x), se = FALSE, colour = "#D55E00", linewidth = 0.9) +
+  facet_wrap(~ Prediktor, scales = "free_x", nrow = 1) +
+  labs(title = "PE terhadap tiap prediktor",
+       subtitle = "Garis putus-putus = linear; garis oranye = smooth. Selisih keduanya = indikasi non-linearitas",
+       x = NULL)
+```
+
+```{r eda-corr-vif}
+corr_table <- as.data.frame(round(cor(df), 3))
+corr_table <- tibble::rownames_to_column(corr_table, var = "Variabel")
+tabel(corr_table, format = "html", caption = "Matriks korelasi antarvariabel",
+             table.attr = 'class="report-table"')
+
+vif_df <- data.frame(Variabel = names(car::vif(lm(PE ~ AT + V + AP + RH, data = df))),
+                     VIF = as.numeric(car::vif(lm(PE ~ AT + V + AP + RH, data = df))))
+tabel(vif_df %>% mutate(VIF = round(VIF, 3)), format = "html",
+             caption = "Variance Inflation Factor (VIF)",
+             table.attr = 'class="report-table"')
+```
+
+AT dan V berkorelasi kuat negatif dengan PE dan juga saling berkorelasi (VIF AT = `r round(vif_df["AT", "VIF"], 2)`). Multikolinearitas ini moderat (VIF < 10), tetapi membuat koefisien individual pada model linear kurang stabil untuk diinterpretasi. Hal ini dibahas di bagian Inferensi vs prediksi.
+
+# Metode
+
+## Pembagian data
+
+Setiap sheet sudah berupa pengacakan baris yang berbeda. Untuk memanfaatkan pengacakan itu, 80% baris awal pada setiap sheet menjadi data latih dan 20% sisanya menjadi data uji. Data latih dipakai untuk menghitung AICc dan menjalankan 10-fold CV; data uji hanya dipakai sekali untuk evaluasi akhir. Fold CV yang sama dipakai untuk semua model dalam sheet tersebut, sehingga perbandingan CV berpasangan. Dokumentasi [UCI](https://archive.ics.uci.edu/dataset/294/combined+cycle+power+plant) menyebut lima pengacakan tersebut disediakan untuk 5×2-fold CV; jadi rancangan saat ini bukan implementasi persis prosedur validasi asli UCI.
+
+```{r split-helpers}
+make_split <- function(n, test_size = TEST_SIZE) {
+  # Setiap worksheet sudah diacak oleh penyedia dataset. Ambil 80% baris awal
+  # sebagai data latih dan 20% sisanya sebagai data uji; antar-sheet, observasi
+  # yang masuk ke data uji berbeda karena urutan barisnya berbeda.
+  n_train <- floor(n * (1 - test_size))
+  list(train = seq_len(n_train), test = seq.int(n_train + 1L, n))
+}
+
+make_folds <- function(n, K = K_FOLDS, seed = RANDOM_STATE) {
+  if (K > n) stop("Jumlah fold tidak boleh melebihi jumlah observasi latih.")
+  set.seed(seed)
+  idx <- sample.int(n)
+  split(idx, rep(seq_len(K), length.out = n))
+}
+```
+
+## Kandidat model
+
+```{r model-specs}
+model_specs <- list(
+  "M0 Linear (baseline)"     = list(type = "lm",
+      f = PE ~ AT + V + AP + RH),
+  "M1 Polinomial-2 aditif"   = list(type = "lm",
+      f = PE ~ poly(AT, 2) + poly(V, 2) + poly(AP, 2) + poly(RH, 2)),
+  "M2 Polinomial-3 aditif"   = list(type = "lm",
+      f = PE ~ poly(AT, 3) + poly(V, 3) + poly(AP, 3) + poly(RH, 3)),
+  "M3 Polinomial-2 + interaksi" = list(type = "lm",
+      f = PE ~ (AT + V + AP + RH)^2 + I(AT^2) + I(V^2) + I(AP^2) + I(RH^2)),
+  "M4 GAM"                   = list(type = "gam",
+      f = PE ~ s(AT, k = 20, bs = "cr") + s(V, k = 20, bs = "cr") +
+          s(AP, k = 20, bs = "cr") + s(RH, k = 20, bs = "cr")),
+  "Random Forest (benchmark)" = list(type = "rf", f = PE ~ AT + V + AP + RH)
+)
+stat_models <- names(model_specs)[sapply(model_specs, `[[`, "type") != "rf"]
+rf_name     <- "Random Forest (benchmark)"
+```
+
+M1 dan M2 memakai basis polinomial ortogonal (`poly()`) agar stabil secara numerik. M3 memuat efek utama, seluruh interaksi dua arah, dan kuadrat masing-masing prediktor sehingga menjadi kandidat polinomial derajat dua yang lebih fleksibel. GAM memakai cubic regression spline (k = 20 per prediktor) dengan smoothing parameter yang diestimasi lewat REML.
+
+## Kriteria
+
+* **AICc** dihitung dengan rumus yang sama untuk semua model statistik: $\text{AIC} = -2\log L + 2k$ dan $\text{AICc} = \text{AIC} + \frac{2k(k+1)}{n-k-1}$. Untuk OLS, $k$ = jumlah koefisien + 1 (varians error). Untuk GAM, $k$ = derajat bebas efektif (edf) + 1, yang diambil dari `logLik()`. Dari AICc dihitung juga $\Delta$AICc dan bobot Akaike.
+* **CV_RMSE** $= \sqrt{\frac{1}{K}\sum_k \text{MSE}_k}$, dengan rumus yang sama untuk semua model. Ketidakpastiannya dilaporkan sebagai SE dari RMSE per fold. Aturan **1-SE** memilih model paling sederhana yang CV_RMSE-nya masih dalam 1 SE dari CV_RMSE terkecil.
+* **Data uji:** RMSE, MAE, dan R², dengan interval kepercayaan 95% bootstrap (B = `r B_BOOT`) untuk RMSE.
+
+```{r core-functions}
+rmse <- function(y, p) sqrt(mean((y - p)^2))
+mae  <- function(y, p) mean(abs(y - p))
+r2   <- function(y, p) 1 - sum((y - p)^2) / sum((y - mean(y))^2)
+
+# Tuning mtry memakai OOB error hanya pada data analisis yang tersedia.
+# Fungsi ini dipanggil ulang pada setiap fold CV, bukan sekali memakai seluruh data.
+tune_rf_mtry <- function(train, num.trees = RF_TREES_CV, seed = RANDOM_STATE) {
+  scores <- vapply(seq_along(features), function(m) {
+    fit <- ranger(
+      PE ~ ., data = train, num.trees = num.trees, mtry = m,
+      seed = seed + m, importance = "none"
+    )
+    fit$prediction.error
+  }, numeric(1))
+  which.min(scores)
+}
+
+fit_model <- function(spec, data, mtry = NULL, importance = "none",
+                      seed = RANDOM_STATE, num.trees = RF_TREES_FINAL) {
+  switch(spec$type,
+    lm  = lm(spec$f, data = data),
+    gam = gam(spec$f, data = data, method = "REML"),
+    rf  = ranger(spec$f, data = data, num.trees = num.trees,
+                 mtry = mtry, seed = seed, importance = importance)
+  )
+}
+
+predict_model <- function(m, newdata) {
+  if (inherits(m, "ranger")) predict(m, data = newdata)$predictions
+  else as.numeric(predict(m, newdata = newdata))
+}
+
+aicc_of <- function(m) {
+  if (inherits(m, "ranger")) return(c(k = NA, logLik = NA, AIC = NA, AICc = NA))
+  ll <- logLik(m)
+  k  <- attr(ll, "df")
+  n  <- nobs(m)
+  aic <- -2 * as.numeric(ll) + 2 * k
+  c(k = k, logLik = as.numeric(ll), AIC = aic,
+    AICc = aic + 2 * k * (k + 1) / (n - k - 1))
+}
+
+# Hyperparameter RF dituning di dalam setiap fold menggunakan OOB pada analysis fold.
+cv_fold_eval <- function(spec, train, folds, seed = RANDOM_STATE) {
+  fold_rmse <- numeric(length(folds))
+  fold_mtry <- rep(NA_integer_, length(folds))
+
+  for (j in seq_along(folds)) {
+    val_idx <- folds[[j]]
+    analysis <- train[-val_idx, , drop = FALSE]
+    validation <- train[val_idx, , drop = FALSE]
+
+    if (spec$type == "rf") {
+      mtry_j <- tune_rf_mtry(analysis, num.trees = RF_TREES_CV,
+                             seed = seed + 100L * j)
+      m <- fit_model(spec, analysis, mtry = mtry_j, seed = seed + 200L * j,
+                     num.trees = RF_TREES_CV)
+      fold_mtry[j] <- mtry_j
+    } else {
+      m <- fit_model(spec, analysis, seed = seed + 200L * j)
+    }
+
+    pred <- predict_model(m, validation)
+    fold_rmse[j] <- rmse(validation$PE, pred)
+  }
+
+  list(rmse = fold_rmse, mtry = fold_mtry)
+}
+
+boot_rmse_ci <- function(err, B = B_BOOT, seed = RANDOM_STATE) {
+  set.seed(seed)
+  bs <- replicate(B, sqrt(mean(sample(err, size = length(err), replace = TRUE)^2)))
+  unname(quantile(bs, c(0.025, 0.975)))
+}
+
+boot_mean_ci <- function(x, B = B_BOOT, seed = RANDOM_STATE) {
+  set.seed(seed)
+  bs <- replicate(B, mean(sample(x, size = length(x), replace = TRUE)))
+  unname(quantile(bs, c(0.025, 0.975)))
+}
+
+# Satu model set di-fit pada satu sheet/permutasi; seluruh kandidat memakai split dan fold sama.
+run_sheet <- function(d, sheet_name, model_seed, fold_seed, keep_models = FALSE) {
+  split_idx <- make_split(nrow(d), test_size = TEST_SIZE)
+  train <- d[split_idx$train, , drop = FALSE]
+  test  <- d[split_idx$test, , drop = FALSE]
+  folds <- make_folds(nrow(train), K = K_FOLDS, seed = fold_seed)
+
+  rows <- list(); fold_list <- list(); models <- list(); test_err <- list()
+  rf_tuning <- data.frame()
+
+  for (i in seq_along(model_specs)) {
+    nm <- names(model_specs)[i]
+    spec <- model_specs[[nm]]
+    cv <- cv_fold_eval(spec, train, folds, seed = fold_seed + 1000L * i)
+    fr <- cv$rmse
+
+    if (spec$type == "rf") {
+      mtry_final <- tune_rf_mtry(train, num.trees = RF_TREES_CV,
+                                 seed = model_seed + 50000L)
+      m <- fit_model(spec, train, mtry = mtry_final,
+                     importance = if (keep_models) "permutation" else "none",
+                     seed = model_seed + 60000L, num.trees = RF_TREES_FINAL)
+      oob_rmse <- sqrt(m$prediction.error)
+      rf_tuning <- data.frame(
+        Sheet = sheet_name, Fold = seq_along(cv$mtry),
+        Selected_mtry = cv$mtry, CV_fold_RMSE = cv$rmse
+      )
+    } else {
+      mtry_final <- NA_integer_
+      m <- fit_model(spec, train, seed = model_seed + 60000L + i)
+      oob_rmse <- NA_real_
+    }
+
+    pred_test <- predict_model(m, test)
+    err_test <- test$PE - pred_test  # positif = model cenderung underpredict
+    pred_train <- predict_model(m, train)
+    ci_rmse <- boot_rmse_ci(err_test, seed = RANDOM_STATE + 10L * i)
+    ci_bias  <- boot_mean_ci(err_test, seed = RANDOM_STATE + 10L * i)
+    a <- aicc_of(m)
+
+    rows[[nm]] <- data.frame(
+      Model = nm, k = unname(a[["k"]]), AICc = unname(a[["AICc"]]),
+      CV_RMSE = sqrt(mean(fr^2)), CV_SE = sd(fr) / sqrt(length(fr)),
+      Train_RMSE = rmse(train$PE, pred_train),
+      Test_RMSE = rmse(test$PE, pred_test),
+      Test_RMSE_lo = ci_rmse[1], Test_RMSE_hi = ci_rmse[2],
+      Test_MAE = mae(test$PE, pred_test), Test_R2 = r2(test$PE, pred_test),
+      Test_Bias = mean(err_test), Test_Bias_lo = ci_bias[1], Test_Bias_hi = ci_bias[2],
+      Test_Bias_rel_pct = 100 * mean(err_test) / mean(test$PE),
+      RF_mtry_final = mtry_final, RF_OOB_RMSE = oob_rmse
+    )
+
+    fold_list[[nm]] <- fr
+    test_err[[nm]] <- err_test
+    if (keep_models) models[[nm]] <- m
+  }
+
+  tab <- do.call(rbind, rows)
+  rownames(tab) <- NULL
+
+  # AICc dan bobot Akaike hanya untuk model statistik M0-M4.
+  is_stat <- tab$Model %in% stat_models
+  tab$dAICc <- NA_real_; tab$w_Akaike <- NA_real_
+  tab$dAICc[is_stat] <- tab$AICc[is_stat] - min(tab$AICc[is_stat])
+  tab$w_Akaike[is_stat] <- exp(-tab$dAICc[is_stat] / 2) /
+    sum(exp(-tab$dAICc[is_stat] / 2))
+
+  st <- tab[is_stat, , drop = FALSE]
+  best_cv_idx <- which.min(st$CV_RMSE)
+  threshold <- min(st$CV_RMSE) + st$CV_SE[best_cv_idx]
+  candidates_1se <- st[st$CV_RMSE <= threshold, , drop = FALSE]
+
+  list(
+    sheet = sheet_name, table = tab,
+    pick = c(AICc = st$Model[which.min(st$AICc)],
+             CV = st$Model[best_cv_idx],
+             OneSE = candidates_1se$Model[which.min(candidates_1se$k)]),
+    folds = fold_list, test_err = test_err, models = models,
+    train = train, test = test, split_idx = split_idx,
+    rf_tuning = rf_tuning
+  )
+}
+```
+
+# Hasil model selection pada lima pengacakan
+
+Setiap sheet dijalankan sebagai satu replikasi evaluasi terpisah. Karena susunan baris tiap sheet berbeda, holdout 20% terakhir menghasilkan bagian uji berbeda; fold CV menggunakan seed berbeda antar-sheet. **Semua model dalam satu sheet memakai split dan fold yang sama.** Model M0–M4 dievaluasi dengan AICc, CV, dan data uji; Random Forest hanya dibandingkan dengan metrik prediksi. UCI memang menyediakan lima pengacakan untuk 5×2-fold CV, tetapi di sini kami mempertahankan desain 80/20 + 10-fold CV, sehingga hasil lima sheet dibaca sebagai uji sensitivitas terhadap pembagian data, bukan sebagai lima dataset independen.
+
+```{r run-all-sheets}
+res_all <- lapply(seq_along(sheets), function(j) {
+  run_sheet(
+    d = data_sheets[[sheets[j]]], sheet_name = sheets[j],
+    model_seed = RANDOM_STATE + 100L * j,
+    fold_seed = RANDOM_STATE + 1000L * j,
+    keep_models = TRUE   # dimodifikasi: model semua sheet disimpan agar kurva dashboard dapat dibuat
+  )
+})
+names(res_all) <- sheets
+res1 <- res_all[[1]]
+m_list <- res1$models
+n_train <- nrow(res1$train)
+
+stab_tab <- dplyr::bind_rows(lapply(sheets, function(sh) {
+  dplyr::mutate(res_all[[sh]]$table, Sheet = sh, .before = 1)
+}))
+
+picks <- dplyr::bind_rows(lapply(sheets, function(sh) {
+  p <- res_all[[sh]]$pick
+  data.frame(Sheet = sh, AICc = unname(p[["AICc"]]),
+             CV = unname(p[["CV"]]), OneSE = unname(p[["OneSE"]]))
+}))
+
+pick_long <- picks %>% tidyr::pivot_longer(
+  cols = c(AICc, CV, OneSE), names_to = "Kriteria", values_to = "Model"
+)
+pick_frequency <- pick_long %>%
+  count(Kriteria, Model, name = "Jumlah_sheet") %>%
+  arrange(Kriteria, desc(Jumlah_sheet), Model)
+
+rf_cv_tuning <- dplyr::bind_rows(lapply(sheets, function(sh) res_all[[sh]]$rf_tuning))
+rf_tuning_frequency <- rf_cv_tuning %>%
+  count(Sheet, Selected_mtry, name = "Jumlah_fold") %>%
+  arrange(Sheet, Selected_mtry)
+
+stab_summary <- stab_tab %>% group_by(Model) %>%
+  summarise(
+    CV_RMSE_mean = mean(CV_RMSE), CV_RMSE_sd = sd(CV_RMSE),
+    Test_RMSE_mean = mean(Test_RMSE), Test_RMSE_sd = sd(Test_RMSE),
+    Test_MAE_mean = mean(Test_MAE), Test_R2_mean = mean(Test_R2),
+    Test_Bias_mean = mean(Test_Bias), Test_Bias_sd = sd(Test_Bias),
+    Mean_abs_Test_Bias = mean(abs(Test_Bias)),
+    Train_RMSE_mean = mean(Train_RMSE),
+    CV_to_Test_gap_mean = mean(Test_RMSE - CV_RMSE),
+    .groups = "drop"
+  ) %>% arrange(CV_RMSE_mean)
+
+bias_by_sheet <- stab_tab %>%
+  select(Sheet, Model, Test_Bias, Test_Bias_lo, Test_Bias_hi, Test_Bias_rel_pct)
+
+rank_agreement <- dplyr::bind_rows(lapply(sheets, function(sh) {
+  st <- res_all[[sh]]$table %>% filter(Model %in% stat_models)
+  data.frame(
+    Sheet = sh,
+    Spearman_rank_AICc_CV = cor(st$AICc, st$CV_RMSE, method = "spearman"),
+    Pemenang_AICc = st$Model[which.min(st$AICc)],
+    Pemenang_CV = st$Model[which.min(st$CV_RMSE)],
+    Pemenang_sama = st$Model[which.min(st$AICc)] == st$Model[which.min(st$CV_RMSE)]
+  )
+}))
+
+# Model pilihan pada sheet pertama digunakan untuk diagnostik rinci dan inferensi ilustratif.
+ref_model <- unname(res1$pick[["CV"]])
+mtry_rf <- res1$table$RF_mtry_final[res1$table$Model == rf_name]
+
+# Tabel lengkap per sheet; nilai AICc, CV, dan metrik uji tidak dirata-ratakan dahulu.
+comparison_by_sheet <- stab_tab %>%
+  select(Sheet, Model, k, AICc, dAICc, w_Akaike, CV_RMSE, CV_SE,
+         Train_RMSE, Test_RMSE, Test_MAE, Test_R2,
+         Test_Bias, Test_Bias_lo, Test_Bias_hi, Test_Bias_rel_pct,
+         RF_mtry_final, RF_OOB_RMSE)
+tabel(comparison_by_sheet %>% mutate(across(where(is.numeric), ~ round(.x, 4))),
+             format = "html", caption = "Perbandingan setiap model pada masing-masing pengacakan",
+             table.attr = 'class="report-table wide-table"')
+
+tabel(picks, format = "html", caption = "Model terpilih menurut AICc, CV_RMSE, dan aturan 1-SE",
+             table.attr = 'class="report-table"')
+tabel(pick_frequency, format = "html", caption = "Frekuensi model terpilih di lima pengacakan",
+             table.attr = 'class="report-table"')
+tabel(rf_tuning_frequency, format = "html", caption = "Frekuensi mtry terpilih pada fold CV Random Forest",
+             table.attr = 'class="report-table"')
+tabel(stab_summary %>% mutate(across(where(is.numeric), ~ round(.x, 4))),
+             format = "html", caption = "Rata-rata dan simpangan baku metrik pada lima pengacakan",
+             table.attr = 'class="report-table wide-table"')
+tabel(rank_agreement, format = "html", caption = "Kesepakatan peringkat/pemenang AICc dan CV",
+             table.attr = 'class="report-table"')
+```
+
+**Cara membaca bias prediksi:** `Test_Bias` didefinisikan sebagai rata-rata `aktual - prediksi`. Nilai positif berarti model cenderung *underpredict*; nilai negatif berarti *overpredict*. Interval bootstrap 95% yang mencakup nol berarti tidak ada bukti kuat tentang bias rata-rata pada subset uji tersebut, tetapi **bukan bukti bahwa model pasti bebas bias**. `Test_Bias_rel_pct` menyatakan bias rata-rata sebagai persentase dari rata-rata PE aktual pada subset uji.
+
+Karena kelima sheet berasal dari observasi yang sama dalam urutan berbeda, simpangan baku pada `stab_summary` mengukur sensitivitas terhadap pengacakan/pembagian data, bukan variasi antar-populasi. Konsistensi pemenang di `pick_frequency` adalah indikator stabilitas pemilihan model. `Train_RMSE` merupakan error pada data yang digunakan untuk fit; untuk menilai generalisasi Random Forest, prioritaskan OOB RMSE, CV_RMSE, dan Test_RMSE.
+
+```{r plot-stability, fig.height=5}
+ggplot(stab_tab, aes(Test_RMSE, factor(Model, levels = rev(names(model_specs))), colour = Sheet)) +
+  geom_point(position = position_jitter(height = 0.10, width = 0, seed = 1), size = 2) +
+  labs(title = "Test RMSE menurut model dan pengacakan", x = "Test RMSE (MW)", y = NULL) +
+  theme(legend.position = "bottom")
+
+ggplot(stab_tab, aes(Test_Bias, factor(Model, levels = rev(names(model_specs))), colour = Sheet)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey35") +
+  geom_errorbarh(aes(xmin = Test_Bias_lo, xmax = Test_Bias_hi), height = 0.18,
+                 position = position_dodge(width = 0.45)) +
+  geom_point(position = position_dodge(width = 0.45), size = 2) +
+  labs(title = "Bias prediksi pada data uji (aktual − prediksi)",
+       subtitle = "Interval bootstrap 95%; nilai positif berarti underprediction",
+       x = "Mean Error / Bias (MW)", y = NULL) +
+  theme(legend.position = "bottom")
+```
+
+## Rincian satu pengacakan: Sheet pertama
+
+Sheet pertama dipakai untuk tabel rinci, perbandingan berpasangan di data uji, diagnostik, dan pembahasan inferensi. Keputusan akhir tetap dibaca bersama hasil lima pengacakan, bukan dari Sheet pertama saja.
+
+```{r main-sheet-table}
+tab1 <- res1$table %>%
+  mutate(across(c(AICc, dAICc), ~ round(.x, 2)),
+         across(c(k, CV_RMSE, CV_SE, Train_RMSE, Test_RMSE, Test_MAE,
+                 Test_Bias, Test_Bias_lo, Test_Bias_hi), ~ round(.x, 3)),
+         w_Akaike = signif(w_Akaike, 3), Test_R2 = round(Test_R2, 4),
+         Test_RMSE_CI95 = sprintf("[%.3f, %.3f]", Test_RMSE_lo, Test_RMSE_hi),
+         Test_Bias_CI95 = sprintf("[%.3f, %.3f]", Test_Bias_lo, Test_Bias_hi)) %>%
+  select(Model, k, AICc, dAICc, w_Akaike, CV_RMSE, CV_SE, Train_RMSE,
+         Test_RMSE, Test_RMSE_CI95, Test_MAE, Test_R2,
+         Test_Bias, Test_Bias_CI95, Test_Bias_rel_pct, RF_mtry_final, RF_OOB_RMSE)
+tabel(tab1, format = "html", caption = paste("Hasil lengkap model pada", sheets[1]),
+             table.attr = 'class="report-table wide-table"')
+
+picked_table <- data.frame(Kriteria = names(res1$pick), Model_terpilih = unname(res1$pick))
+tabel(picked_table, format = "html", caption = "Ringkasan model terpilih pada pengacakan pertama",
+             table.attr = 'class="report-table"')
+```
+
+```{r plot-cv-aic, fig.height=4}
+pd <- res1$table %>% mutate(Model = factor(Model, levels = rev(names(model_specs))))
+ggplot(pd, aes(CV_RMSE, Model)) +
+  geom_errorbarh(aes(xmin = CV_RMSE - CV_SE, xmax = CV_RMSE + CV_SE), height = 0.25) +
+  geom_point(size = 2.5, aes(colour = Model == rf_name), show.legend = FALSE) +
+  scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "#0072B2")) +
+  labs(title = "CV_RMSE ± 1 SE pada data latih pengacakan pertama",
+       x = "CV_RMSE (MW)", y = NULL)
+```
+
+## Apakah perbedaan akurasi data uji meyakinkan?
+
+Selisih RMSE uji setiap model terhadap model statistik terpilih menurut CV pada sheet pertama dihitung dengan bootstrap berpasangan (observasi uji yang sama diresampling untuk kedua model):
+
+```{r paired-boot}
+paired_diff <- function(e_a, e_b, B = B_BOOT, seed = RANDOM_STATE) {
+  set.seed(seed)
+  n <- length(e_a)
+  d <- replicate(B, {
+    i <- sample.int(n, size = n, replace = TRUE)
+    sqrt(mean(e_a[i]^2)) - sqrt(mean(e_b[i]^2))
+  })
+  c(est = sqrt(mean(e_a^2)) - sqrt(mean(e_b^2)),
+    quantile(d, c(.025, .975)))
+}
+
+diff_df <- do.call(rbind, lapply(setdiff(names(model_specs), ref_model), function(nm) {
+  x <- paired_diff(res1$test_err[[nm]], res1$test_err[[ref_model]])
+  data.frame(Model = nm, Selisih_RMSE = x[["est"]],
+             CI_lo = x[["2.5%"]], CI_hi = x[["97.5%"]],
+             Signifikan = x[["2.5%"]] > 0 | x[["97.5%"]] < 0)
+}))
+diff_df$Pembanding <- ref_model
+tabel(diff_df %>% mutate(across(c(Selisih_RMSE, CI_lo, CI_hi), ~ round(.x, 3))),
+             format = "html", caption = paste("Selisih RMSE uji relatif terhadap", ref_model),
+             table.attr = 'class="report-table"')
+```
+
+Selisih positif berarti model pembanding memiliki RMSE lebih tinggi daripada `r ref_model`. Jika interval mencakup nol, perbedaan akurasi pada subset uji pertama belum meyakinkan. Hasil ini merupakan pelengkap; stabilitas lintas pengacakan tetap dilihat di tabel sebelumnya.
+
+# Diagnostik model terpilih
+
+Diagnostik dilakukan pada model terpilih menurut CV (**`r ref_model`**) dan pada baseline linear sebagai pembanding.
+
+```{r diag-setup}
+m_sel  <- res1$models[[ref_model]]
+m_base <- res1$models[["M0 Linear (baseline)"]]
+train1 <- res1$train
+
+diag_data <- function(m, label) {
+  data.frame(Model = label, fitted = as.numeric(fitted(m)),
+             resid = as.numeric(residuals(m)), cook = as.numeric(cooks.distance(m)))
+}
+dd <- rbind(diag_data(m_base, "M0 Linear (baseline)"), diag_data(m_sel, ref_model))
+```
+
+```{r diag-resid, fig.height=4}
+ggplot(dd, aes(fitted, resid)) +
+  geom_point(alpha = 0.1, size = 0.6) +
+  geom_hline(yintercept = 0, colour = "red") +
+  geom_smooth(method = "gam", formula = y ~ s(x), se = FALSE, colour = "#D55E00") +
+  facet_wrap(~ Model) + labs(title = "Residual vs fitted", x = "Fitted PE", y = "Residual")
+
+ggplot(dd, aes(sample = resid)) + stat_qq(alpha = 0.2, size = 0.6) + stat_qq_line(colour = "red") +
+  facet_wrap(~ Model) + labs(title = "QQ-plot residual")
+```
+
+```{r diag-tests}
+# Breusch-Pagan versi umum (nR^2 dari regresi residual^2 ke prediktor) agar berlaku untuk lm dan GAM
+bp_general <- function(resid, X) {
+  aux <- lm(resid^2 ~ ., data = X); n <- length(resid)
+  stat <- n * summary(aux)$r.squared
+  c(BP = stat, p = pchisq(stat, df = ncol(X), lower.tail = FALSE))
+}
+set.seed(RANDOM_STATE)
+sw <- function(r) shapiro.test(sample(r, min(5000, length(r))))$p.value
+
+assump <- rbind(
+  data.frame(Model = "M0 Linear (baseline)", t(bp_general(residuals(m_base), train1[, features])),
+             Shapiro_p = sw(residuals(m_base))),
+  data.frame(Model = ref_model, t(bp_general(residuals(m_sel), train1[, features])),
+             Shapiro_p = sw(residuals(m_sel))))
+tabel(assump %>% mutate(BP = round(BP, 2), across(c(p, Shapiro_p), ~ signif(.x, 3))),
+      caption = "Uji asumsi residual: Breusch-Pagan versi umum dan Shapiro-Wilk")
+```
+
+Dengan n ≈ `r n_train`, uji formal hampir selalu menolak H0 meskipun penyimpangannya kecil. Karena itu, keputusan didasarkan pada plot. Penyimpangan normalitas dan heteroskedastisitas **tidak mengganggu prediksi titik maupun CV**, tetapi memengaruhi SE/p-value klasik. Inilah alasan inferensi baseline di bagian Inferensi memakai SE robust HC3.
+
+```{r diag-cook, fig.height=3.5}
+thr_cook <- 4 / n_train
+cook_sum <- dd %>% group_by(Model) %>%
+  summarise(n_cook_gt_4n = sum(cook > thr_cook), max_cook = max(cook), .groups = "drop")
+tabel(cook_sum, caption = "Ringkasan Cook's distance per model")
+
+ggplot(dd %>% group_by(Model) %>% mutate(idx = row_number()), aes(idx, cook)) +
+  geom_segment(aes(xend = idx, yend = 0), alpha = 0.4) +
+  geom_hline(yintercept = thr_cook, colour = "red", linetype = 2) +
+  facet_wrap(~ Model, scales = "free_y") + labs(title = "Cook's distance (garis merah = 4/n)", x = "Observasi", y = "Cook's D")
+
+# Sensitivitas: refit model terpilih tanpa observasi Cook's D > 4/n, lalu bandingkan RMSE uji
+infl <- which(cooks.distance(m_sel) > thr_cook)
+train_noinfl <- if (length(infl) > 0) train1[-infl, , drop = FALSE] else train1
+m_sel_noinfl <- fit_model(model_specs[[ref_model]], train_noinfl,
+                          seed = RANDOM_STATE + 91001)
+sens_infl <- data.frame(
+  Skenario = c("Semua data latih", sprintf("Tanpa %d observasi berpengaruh", length(infl))),
+  Test_RMSE = c(rmse(res1$test$PE, predict_model(m_sel, res1$test)),
+                rmse(res1$test$PE, predict_model(m_sel_noinfl, res1$test))))
+tabel(sens_infl, caption = "Sensitivitas: RMSE uji dengan dan tanpa observasi berpengaruh")
+```
+
+```{r diag-gam-specific}
+if (inherits(m_sel, "gam")) {
+  kcheck_table <- as.data.frame(k.check(m_sel))
+  kcheck_table <- tibble::rownames_to_column(kcheck_table, var = "Smooth")
+  tabel(kcheck_table, format = "html",
+               caption = "Pemeriksaan dimensi basis GAM (k-index < 1 dan p kecil perlu ditinjau)",
+               table.attr = 'class="report-table"')
+
+  concurvity_table <- as.data.frame(round(concurvity(m_sel, full = TRUE), 3))
+  concurvity_table <- tibble::rownames_to_column(concurvity_table, var = "Komponen")
+  tabel(concurvity_table, format = "html",
+               caption = "Concurvity GAM (nilai tinggi perlu diwaspadai)",
+               table.attr = 'class="report-table"')
+}
+```
+
+# Inferensi vs prediksi
+
+## Inferensi: apa yang bisa dikatakan tentang hubungan
+
+**Baseline linear dengan SE robust (HC3).** Koefisiennya mudah ditafsirkan sebagai perubahan PE per satuan prediktor dengan prediktor lain tetap, tetapi hanya valid jika hubungannya memang linear.
+
+```{r inference-baseline}
+ct <- coeftest(m_base, vcov. = vcovHC(m_base, type = "HC3"))
+ci <- coefci(m_base, vcov. = vcovHC(m_base, type = "HC3"))
+tabel(data.frame(Estimasi = ct[, 1], SE_HC3 = ct[, 2], CI_lo = ci[, 1], CI_hi = ci[, 2], p = ct[, 4]) %>%
+  round(4),
+      caption = "Koefisien baseline linear dengan SE robust HC3")
+```
+
+**Uji F bersarang.** Apakah penambahan kelengkungan dan interaksi didukung data?
+
+```{r inference-nested}
+# Model bersarang: M0, M1, dan M2
+m0 <- m_list[["M0 Linear (baseline)"]]
+m1 <- m_list[["M1 Polinomial-2 aditif"]]
+m2 <- m_list[["M2 Polinomial-3 aditif"]]
+m3 <- m_list[["M3 Polinomial-2 + interaksi"]]
+
+anova_012 <- as.data.frame(anova(m0, m1, m2))
+anova_012 <- tibble::rownames_to_column(
+  anova_012, var = "Model"
+)
+
+tabel(
+  anova_012,
+  format = "html",
+  caption = "Perbandingan model bersarang: M0, M1, dan M2",
+  table.attr = 'class="report-table"'
+)
+
+# Perbandingan M1 dan M3
+anova_13 <- as.data.frame(anova(m1, m3))
+anova_13 <- tibble::rownames_to_column(
+  anova_13, var = "Model"
+)
+
+tabel(
+  anova_13,
+  format = "html",
+  caption = "Perbandingan model bersarang: M1 dan M3",
+  table.attr = 'class="report-table"'
+)
+```
+
+**GAM: signifikansi dan bentuk tiap fungsi smooth.** edf ≈ 1 berarti hubungannya praktis linear, sedangkan edf yang besar berarti hubungannya melengkung.
+
+```{r inference-gam, fig.height=6}
+m_gam <- m_list[["M4 GAM"]]
+gam_s <- as.data.frame(round(summary(m_gam)$s.table, 4))
+gam_s <- tibble::rownames_to_column(gam_s, var = "Smooth")
+tabel(gam_s, format = "html", caption = "Signifikansi dan derajat bebas efektif smooth GAM",
+             table.attr = 'class="report-table"')
+plot(m_gam, pages = 1, shade = TRUE, seWithMean = TRUE, scale = 0, residuals = FALSE)
+```
+
+## Prediksi: apa yang bisa dan tidak bisa dikatakan dari benchmark Random Forest
+
+```{r rf-importance}
+m_rf <- m_list[[rf_name]]
+imp <- sort(importance(m_rf), decreasing = TRUE)
+importance_table <- data.frame(Variabel = names(imp),
+                               Permutation_importance = round(as.numeric(imp), 2))
+tabel(importance_table, format = "html", caption = "Permutation importance Random Forest",
+             table.attr = 'class="report-table"')
+
+# Pilihan mtry akhir untuk pengacakan pertama dan OOB RMSE-nya
+res1$table %>% filter(Model == rf_name) %>%
+  select(Model, RF_mtry_final, RF_OOB_RMSE, CV_RMSE, Test_RMSE) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  tabel(format = "html", caption = "Kinerja Random Forest pada pengacakan pertama",
+               table.attr = 'class="report-table"')
+```
+
+```{r pdp-compare, fig.height=4}
+# Partial dependence AT: RF vs GAM, dihitung dengan cara yang sama agar sebanding
+set.seed(RANDOM_STATE)
+pdp_base <- train1[sample(nrow(train1), 1000), ]
+grid_at  <- seq(quantile(train1$AT, .01), quantile(train1$AT, .99), length.out = 40)
+pdp <- do.call(rbind, lapply(grid_at, function(g) {
+  nd <- pdp_base; nd$AT <- g
+  data.frame(AT = g, RF = mean(predict_model(m_rf, nd)), GAM = mean(predict_model(m_gam, nd)))
+})) %>% pivot_longer(-AT, names_to = "Model", values_to = "PE")
+ggplot(pdp, aes(AT, PE, colour = Model)) + geom_line(linewidth = 1) +
+  scale_colour_manual(values = c(GAM = "#D55E00", RF = "#0072B2")) +
+  labs(title = "Partial dependence PE terhadap AT", y = "Rata-rata prediksi PE (MW)")
+```
+
+**Perbedaan inferensi statistik dan predictive accuracy:**
+
+* Model M0–M4 menjawab **bagaimana** PE berubah terhadap tiap prediktor. Jawabannya datang dengan ketidakpastian yang terukur (CI, uji F, signifikansi smooth) dan dapat dibandingkan lewat AICc karena semuanya punya likelihood.
+* Random Forest hanya menjawab **seberapa akurat** PE dapat diprediksi. Jika RMSE-nya lebih kecil, itu berarti ada struktur (misalnya interaksi tingkat tinggi) yang belum ditangkap kandidat model statistik. Namun itu **tidak** memberi koefisien, CI, atau uji hipotesis.
+* **Yang tidak boleh disimpulkan dari benchmark:** (1) *permutation importance* bukan efek kausal dan bisa terdistorsi oleh korelasi AT–V; (2) RMSE yang lebih kecil tidak berarti model "benar", melainkan hanya lebih akurat pada distribusi data ini; (3) RF tidak dapat diekstrapolasi di luar rentang data latih (prediksinya mendatar); (4) RF tidak bisa diikutkan dalam perbandingan AICc.
+
+# Pembahasan
+
+```{r pembahasan-numbers, include=FALSE}
+cv_mean <- setNames(stab_summary$CV_RMSE_mean, stab_summary$Model)
+te_mean <- setNames(stab_summary$Test_RMSE_mean, stab_summary$Model)
+n_agree <- sum(rank_agreement$Pemenang_sama)
+n_sheet <- nrow(rank_agreement)
+pair_count <- function(metric) sum(sapply(sheets, function(sh) {
+  tb <- res_all[[sh]]$table
+  v  <- tb[[metric]]
+  v[tb$Model == "M2 Polinomial-3 aditif"] < v[tb$Model == "M3 Polinomial-2 + interaksi"]
+}))
+m2_lebih_cv    <- pair_count("CV_RMSE")
+m2_lebih_aicc <- pair_count("AICc")
+m2_lebih_test <- pair_count("Test_RMSE")
+winner_cv <- paste(unique(rank_agreement$Pemenang_CV), collapse = ", ")
+```
+
+**Model statistik terbaik.** Pada `r n_agree` dari `r n_sheet` pengacakan, model terpilih oleh AICc sama dengan model terpilih oleh CV. Model yang menang pada kedua kriteria adalah `r winner_cv`. Rata-rata CV_RMSE-nya `r round(cv_mean[["M4 GAM"]], 3)` MW, sedangkan polinomial terbaik (M2) `r round(cv_mean[["M2 Polinomial-3 aditif"]], 3)` MW dan baseline linear (M0) `r round(cv_mean[["M0 Linear (baseline)"]], 3)` MW. Ini menunjukkan bahwa hubungan PE dengan kondisi lingkungan memang tidak linear, dan fleksibilitas yang lebih besar dari GAM menangkap bentuk tersebut lebih baik daripada polinomial dengan derajat tetap.
+
+**Peran polinomial dan interaksi.** Uji F bersarang antara M1 dan M3 signifikan (F = `r round(anova_13[["F"]][2], 2)`, p < 0,001), sehingga interaksi memang menurunkan RSS pada data latih. Namun, M2 (aditif derajat 3) mengungguli M3 (derajat 2 dengan interaksi) pada AICc di `r m2_lebih_aicc` dari `r n_sheet` pengacakan, pada CV_RMSE di `r m2_lebih_cv` dari `r n_sheet`, dan pada RMSE data uji di `r m2_lebih_test` dari `r n_sheet`. Dengan kata lain, kelengkungan yang lebih fleksibel lebih berguna untuk prediksi daripada interaksi dua arah, meskipun interaksi tetap memberi perbaikan dalam sampel.
+
+**Random Forest sebagai benchmark.** Random Forest memiliki CV_RMSE rata-rata `r round(cv_mean[[rf_name]], 3)` MW, lebih rendah daripada GAM. Selisih ini menandakan bahwa ada struktur yang belum sepenuhnya ditangkap oleh kandidat statistik, misalnya interaksi tingkat tinggi. Namun, Random Forest tidak memberi koefisien, interval kepercayaan, atau uji hipotesis, sehingga ia tidak menggantikan model statistik untuk tujuan inferensi.
+
+# Keterbatasan
+
+1. Data hanya mencakup kondisi **beban penuh** pada satu pembangkit, sehingga model tidak berlaku untuk beban parsial atau pembangkit lain.
+2. Tidak ada informasi waktu. Jika observasi berurutan per jam saling berkorelasi, CV acak dapat sedikit terlalu optimis.
+3. AICc hanya membandingkan model **di dalam himpunan kandidat**. Model terbaik menurut AICc belum tentu model yang benar.
+4. Hasil AICc untuk GAM bergantung pada pendekatan edf. Smoothing parameter yang diestimasi menambah ketidakpastian yang tidak sepenuhnya tercermin di $k$.
+5. Residual tidak normal dan heteroskedastik, sehingga inferensi klasik pada model polinomial perlu dibaca hati-hati (SE robust dipakai pada baseline).
+6. Random Forest adalah benchmark prediksi, bukan model inferensi yang dibandingkan dengan AICc. Tuning `mtry` dilakukan hanya pada data analisis yang tersedia: menggunakan OOB error di dalam setiap fold CV dan di data latih untuk fit final. Pendekatan ini mengurangi risiko tuning memakai fold validasi, meskipun performa tetap harus ditafsirkan sebagai hasil pada distribusi data CCPP ini.
+
+# Kesimpulan
+
+1. Hubungan PE dengan AT, V, AP, dan RH tidak sepenuhnya linear. Model GAM, yang tidak membatasi bentuk kurva, menjadi kandidat statistik terbaik pada kelima pengacakan.
+2. AICc dan CV memilih model yang sama pada `r n_agree` dari `r n_sheet` pengacakan, sehingga kedua kriteria cukup konsisten untuk himpunan kandidat ini.
+3. Interaksi dua arah (M3) memperbaiki M1 secara signifikan menurut uji F, tetapi M2 (aditif derajat 3) tetap mengungguli M3 di kelima pengacakan pada AICc, CV, dan data uji. Dalam data ini, kelengkungan lebih penting daripada interaksi.
+4. Random Forest memberikan akurasi prediksi tertinggi, sehingga masih ada struktur yang belum tertangkap oleh model statistik. Untuk tujuan menjelaskan hubungan dan menguji hipotesis, model statistik (terutama GAM) tetap menjadi pilihan utama; untuk prediksi semata, Random Forest layak dipertimbangkan.
+
+# Ekspor hasil untuk dashboard Shiny
+
+Semua hasil analisis di atas disimpan **sekali** ke satu berkas `hasil_analisis_dashboard.rds`. Dashboard Shiny (`app.R`) hanya membaca berkas ini dan **tidak menghitung ulang model apa pun**. Selain objek hasil yang sudah ada di atas, bagian ini hanya menambahkan keperluan slider dashboard: kurva prediksi tiap model (prediktor lain ditahan pada median data latih), grid faktor penalti (`sp`) GAM, dan grid `mtry` Random Forest. Seluruhnya memakai data latih, data uji, dan fold CV yang sama dengan analisis utama.
+
+```{r export-dashboard, include=FALSE}
+RESULTS_FILE     <- "hasil_analisis_dashboard.rds"
+GAM_SP_EXPONENTS <- -3:3                 # faktor penalti GAM = 10^eksponen x sp hasil REML
+RF_MTRY_GRID     <- seq_along(features)  # grid mtry untuk slider Random Forest
+N_GRID_LINE      <- 100                  # jumlah titik kurva prediksi per prediktor
+N_SCATTER_EDA    <- 2500                 # titik scatter EDA yang disimpan
+N_DIAG_SAMPLE    <- 3000                 # titik residual yang disimpan untuk plot diagnostik
+gam_name         <- "M4 GAM"
+
+# ---------- fungsi bantu ----------
+skew_u <- function(x) {
+  n <- length(x); m <- mean(x)
+  g1 <- mean((x - m)^3) / mean((x - m)^2)^1.5
+  g1 * sqrt(n * (n - 1)) / (n - 2)
+}
+kurt_u <- function(x) {
+  n <- length(x); m <- mean(x); m2 <- mean((x - m)^2)
+  g2 <- mean((x - m)^4) / m2^2 - 3
+  (n - 1) / ((n - 2) * (n - 3)) * ((n + 1) * g2 + 6)
+}
+mode_val <- function(x) { ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
+plain_df <- function(x) { x <- as.data.frame(x); rownames(x) <- NULL; x }
+
+make_grids <- function(d) {
+  setNames(lapply(features, function(f) seq(min(d[[f]]), max(d[[f]]), length.out = N_GRID_LINE)), features)
+}
+make_lines <- function(m, grids, base_row) {
+  setNames(lapply(features, function(f) {
+    nd <- base_row[rep(1, length(grids[[f]])), , drop = FALSE]
+    nd[[f]] <- grids[[f]]
+    rownames(nd) <- NULL
+    as.numeric(predict_model(m, nd))
+  }), features)
+}
+
+# ---------- eksplorasi data per sheet ----------
+eda_for_sheet <- function(d) {
+  vars <- c(features, target)
+  desc <- do.call(rbind, lapply(vars, function(v) {
+    x <- d[[v]]; q <- quantile(x, c(.25, .5, .75), names = FALSE)
+    data.frame(Variabel = v, count = length(x), mean = mean(x), std = sd(x), min = min(x),
+               Q1 = q[1], median = q[2], mode = mode_val(x), Q3 = q[3], max = max(x),
+               IQR = q[3] - q[1], skewness = skew_u(x), kurtosis = kurt_u(x))
+  }))
+  outl <- do.call(rbind, lapply(vars, function(v) {
+    q <- quantile(d[[v]], c(.25, .75), names = FALSE); i <- q[2] - q[1]
+    lb <- q[1] - 1.5 * i; ub <- q[2] + 1.5 * i
+    data.frame(Variabel = v, Q1 = q[1], Q3 = q[2], IQR = i, Batas_bawah = lb, Batas_atas = ub,
+               Outlier = sum(d[[v]] < lb | d[[v]] > ub))
+  }))
+  v <- car::vif(lm(PE ~ AT + V + AP + RH, data = d))
+  set.seed(RANDOM_STATE)
+  smp <- d[sample(nrow(d), min(N_SCATTER_EDA, nrow(d))), vars]
+  lines <- setNames(lapply(features, function(f) {
+    dd1 <- data.frame(x = d[[f]], y = d[[target]])
+    g <- seq(min(dd1$x), max(dd1$x), length.out = N_GRID_LINE)
+    list(x = g,
+         lm = as.numeric(predict(lm(y ~ x, data = dd1), newdata = data.frame(x = g))),
+         smooth = as.numeric(predict(mgcv::gam(y ~ s(x), data = dd1), newdata = data.frame(x = g))))
+  }), features)
+  list(n = nrow(d), n_missing = sum(is.na(d)), n_dup = sum(duplicated(d)),
+       desc = plain_df(desc), outlier = plain_df(outl), corr = cor(d[, vars]),
+       vif = data.frame(Variabel = names(v), VIF = as.numeric(v)),
+       data = plain_df(d[, vars]), scatter = plain_df(smp), lines = lines)
+}
+
+# ---------- hasil per sheet (kurva model + grid slider) ----------
+dash_sheets <- lapply(seq_along(sheets), function(j) {
+  sh <- sheets[j]; res <- res_all[[sh]]
+  train <- res$train; test <- res$test; d <- data_sheets[[sh]]
+  fold_seed  <- RANDOM_STATE + 1000L * j
+  model_seed <- RANDOM_STATE + 100L * j
+  grids    <- make_grids(d)
+  base_row <- as.data.frame(lapply(train[, features, drop = FALSE], median))
+  folds    <- make_folds(nrow(train), K = K_FOLDS, seed = fold_seed)   # fold yang sama dengan run_sheet
+
+  # model akhir (M0-M4 dan RF) -> prediksi data uji + kurva
+  final <- lapply(setNames(nm = names(model_specs)), function(nm) {
+    m <- res$models[[nm]]
+    list(pred = as.numeric(predict_model(m, test)),
+         lines = make_lines(m, grids, base_row))
+  })
+
+  # grid faktor penalti GAM: sp = sp_REML x 10^e (AICc dari logLik, CV dengan fold yang sama).
+  # Catatan: pada sp tetap, logLik() mgcv memakai edf biasa; pada fit REML utama memakai edf terkoreksi
+  # (edf2), sehingga AICc grid pada e = 0 sedikit berbeda dari AICc M4 di tabel utama.
+  sp0  <- res$models[[gam_name]]$sp
+  spec <- model_specs[[gam_name]]
+  gam_grid <- lapply(GAM_SP_EXPONENTS, function(e) {
+    sp  <- sp0 * 10^e
+    fit <- gam(spec$f, data = train, sp = sp, method = "REML")
+    a   <- aicc_of(fit)
+    fr  <- vapply(folds, function(idx) {
+      fj <- gam(spec$f, data = train[-idx, , drop = FALSE], sp = sp, method = "REML")
+      rmse(train$PE[idx], predict_model(fj, train[idx, , drop = FALSE]))
+    }, numeric(1))
+    list(exponent = e, mult = 10^e, edf = sum(fit$edf), k = unname(a[["k"]]),
+         aicc = unname(a[["AICc"]]), cv = sqrt(mean(fr^2)),
+         pred = as.numeric(predict_model(fit, test)),
+         lines = make_lines(fit, grids, base_row))
+  })
+
+  # grid mtry Random Forest: CV dengan mtry tetap + OOB + prediksi data uji
+  mtry_final <- res$table$RF_mtry_final[res$table$Model == rf_name]
+  rf_grid <- lapply(RF_MTRY_GRID, function(mt) {
+    fr <- vapply(seq_along(folds), function(i) {
+      idx <- folds[[i]]
+      fit <- ranger(PE ~ ., data = train[-idx, , drop = FALSE], num.trees = RF_TREES_CV,
+                    mtry = mt, seed = fold_seed + 300L * i + mt)
+      rmse(train$PE[idx], predict_model(fit, train[idx, features, drop = FALSE]))
+    }, numeric(1))
+    fit <- ranger(PE ~ ., data = train, num.trees = RF_TREES_FINAL, mtry = mt,
+                  seed = model_seed + 60000L)
+    list(mtry = mt, cv = sqrt(mean(fr^2)), oob = sqrt(fit$prediction.error),
+         is_final = identical(as.integer(mt), as.integer(mtry_final)),
+         pred = as.numeric(predict_model(fit, test)),
+         lines = make_lines(fit, grids, base_row))
+  })
+
+  list(sheet = sh, table = res$table, pick = res$pick, folds = res$folds,
+       rf_tuning = res$rf_tuning, n_train = nrow(train), n_test = nrow(test),
+       X_test = plain_df(test[, features, drop = FALSE]), y_test = test$PE,
+       grids = grids, final = final, gam_grid = gam_grid, rf_grid = rf_grid,
+       eda = eda_for_sheet(d))
+})
+names(dash_sheets) <- sheets
+
+# ---------- diagnostik & inferensi (pengacakan pertama) ----------
+set.seed(RANDOM_STATE)
+ii <- sort(sample(nrow(train1), min(N_DIAG_SAMPLE, nrow(train1))))
+grp <- factor(rep(c("base", "sel"), each = nrow(train1)), levels = c("base", "sel"))
+resid_smooth <- function(f, r) {
+  g <- seq(min(f), max(f), length.out = 80)
+  fit <- mgcv::gam(r ~ s(x), data = data.frame(r = r, x = f))
+  data.frame(x = g, y = as.numeric(predict(fit, newdata = data.frame(x = g))))
+}
+diag_parts <- lapply(split(dd, grp), function(z) {
+  qq <- qqnorm(z$resid, plot.it = FALSE)
+  o  <- order(qq$x); pick_i <- unique(round(seq(1, length(o), length.out = 600)))
+  q  <- quantile(z$resid, c(.25, .75), names = FALSE); tq <- qnorm(c(.25, .75))
+  slope <- diff(q) / diff(tq)
+  list(label = z$Model[1], sample = plain_df(z[ii, c("fitted", "resid")]),
+       smooth = resid_smooth(z$fitted, z$resid),
+       qq = data.frame(x = qq$x[o][pick_i], y = qq$y[o][pick_i]),
+       qq_line = c(intercept = q[1] - slope * tq[1], slope = slope),
+       cook = signif(z$cook, 4))
+})
+
+gam_effects <- NULL
+if (inherits(m_sel, "gam") || inherits(m_gam, "gam")) {
+  base1 <- as.data.frame(lapply(train1[, features, drop = FALSE], median))
+  gam_effects <- do.call(rbind, lapply(features, function(f) {
+    g  <- seq(min(train1[[f]]), max(train1[[f]]), length.out = N_GRID_LINE)
+    nd <- base1[rep(1, length(g)), , drop = FALSE]; nd[[f]] <- g; rownames(nd) <- NULL
+    pr <- predict(m_gam, newdata = nd, type = "terms", se.fit = TRUE)
+    col <- paste0("s(", f, ")")
+    data.frame(Variabel = f, x = g, fit = as.numeric(pr$fit[, col]), se = as.numeric(pr$se.fit[, col]))
+  }))
+}
+
+hc3_df <- data.frame(Term = rownames(ct), Estimasi = ct[, 1], SE_HC3 = ct[, 2],
+                     CI_lo = ci[, 1], CI_hi = ci[, 2], p = ct[, 4], row.names = NULL)
+
+dash_detail <- list(
+  ref_model = ref_model, mtry_rf = mtry_rf, n_train = n_train, thr_cook = thr_cook,
+  diag = diag_parts, assump = plain_df(assump), cook_sum = plain_df(cook_sum),
+  sens_infl = plain_df(sens_infl),
+  kcheck = if (exists("kcheck_table")) plain_df(kcheck_table) else NULL,
+  concurvity = if (exists("concurvity_table")) plain_df(concurvity_table) else NULL,
+  hc3 = hc3_df, anova_012 = plain_df(anova_012), anova_13 = plain_df(anova_13),
+  gam_smooth = plain_df(gam_s), gam_effects = gam_effects,
+  rf_importance = plain_df(importance_table),
+  rf_perf = plain_df(res1$table %>% filter(Model == rf_name) %>%
+                       select(Model, RF_mtry_final, RF_OOB_RMSE, CV_RMSE, Test_RMSE)),
+  pdp = plain_df(pdp), paired_diff = plain_df(diff_df)
+)
+
+dash_payload <- list(
+  meta = list(
+    created = format(Sys.time(), "%Y-%m-%d %H:%M:%S"), r_version = R.version.string,
+    data_file = DATA_FILE,
+    data_md5 = if (file.exists(DATA_FILE)) unname(tools::md5sum(DATA_FILE)) else NA_character_,
+    sheets = sheets, features = features, target = target,
+    models = names(model_specs), stat_models = stat_models, rf_name = rf_name,
+    n_total = n_total, n_train = n_train, n_test = nrow(res1$test),
+    test_size = TEST_SIZE, k_folds = K_FOLDS, seed = RANDOM_STATE, b_boot = B_BOOT,
+    rf_trees_cv = RF_TREES_CV, rf_trees_final = RF_TREES_FINAL,
+    gam_sp_exponents = GAM_SP_EXPONENTS, rf_mtry_grid = RF_MTRY_GRID,
+    title = "Model Selection dengan AIC/CV untuk Prediksi Output Listrik CCPP"
+  ),
+  data_dict = plain_df(data_dict),
+  sheets = dash_sheets,
+  summary = list(
+    stab_tab = plain_df(stab_tab), picks = plain_df(picks), pick_frequency = plain_df(pick_frequency),
+    rf_tuning_frequency = plain_df(rf_tuning_frequency), stab_summary = plain_df(stab_summary),
+    rank_agreement = plain_df(rank_agreement), verify_df = plain_df(verify_df),
+    cv_mean = cv_mean, te_mean = te_mean, n_agree = n_agree, n_sheet = n_sheet,
+    m2_lebih_aicc = m2_lebih_aicc, m2_lebih_cv = m2_lebih_cv, m2_lebih_test = m2_lebih_test,
+    winner_cv = winner_cv, F_M1_M3 = anova_13[["F"]][2]
+  ),
+  detail = dash_detail
+)
+saveRDS(dash_payload, RESULTS_FILE)
+```
+
+Berkas hasil tersimpan sebagai **`r RESULTS_FILE`** (`r round(file.size(RESULTS_FILE) / 1024^2, 2)` MB, dibuat `r dash_payload$meta$created`). Salin berkas ini ke folder yang sama dengan `app.R`, lalu jalankan dashboard dengan `shiny::runApp()`.
